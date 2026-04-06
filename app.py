@@ -699,12 +699,35 @@ def render_claim_under_review(result: Dict[str, Any]) -> None:
                 st.write(f"- {item}")
 
 
+def canonical_source_buckets(sources: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    supporting: List[Dict[str, Any]] = []
+    contradicting: List[Dict[str, Any]] = []
+    contextual: List[Dict[str, Any]] = []
+    for s in sources or []:
+        cat = normalize_evidence_category(s.get("evidence_category", ""))
+        support = (s.get("claim_support") or "").strip().lower()
+        if cat in {"direct_evidence", "credible_reporting", "expert_analysis"} and support == "supports":
+            supporting.append(s)
+        elif cat in {"credible_contradiction", "denial_or_rebuttal"} or (
+            cat in {"direct_evidence", "credible_reporting", "expert_analysis"} and support == "contradicts"
+        ):
+            contradicting.append(s)
+        else:
+            contextual.append(s)
+    return {
+        "supporting": supporting,
+        "contradicting": contradicting,
+        "contextual": contextual,
+    }
+
+
 def render_evidence_snapshot(sources: List[Dict[str, Any]]) -> None:
     if not sources:
         return
-    supporting = [s for s in sources if normalize_claim_support(s.get("claim_support")) == "Supports"]
-    contradicting = [s for s in sources if normalize_claim_support(s.get("claim_support")) == "Contradicts"]
-    contextual = [s for s in sources if normalize_claim_support(s.get("claim_support")) in {"Mixed", "Context"}]
+    buckets = canonical_source_buckets(sources)
+    supporting = buckets["supporting"]
+    contradicting = buckets["contradicting"]
+    contextual = buckets["contextual"]
 
     st.markdown("### Evidence snapshot")
     c1, c2, c3 = st.columns(3)
@@ -712,12 +735,12 @@ def render_evidence_snapshot(sources: List[Dict[str, Any]]) -> None:
     c2.metric("Contradicting sources", len(contradicting))
     c3.metric("Contextual or mixed", len(contextual))
 
-    buckets = [
+    sections = [
         ("Evidence supporting the claim", supporting),
         ("Evidence contradicting the claim", contradicting),
         ("Neutral or contextual evidence", contextual),
     ]
-    for title, bucket in buckets:
+    for title, bucket in sections:
         st.markdown(f"**{title}**")
         if not bucket:
             st.caption("None surfaced in the reviewed set.")
@@ -729,9 +752,10 @@ def render_evidence_snapshot(sources: List[Dict[str, Any]]) -> None:
 
 def render_assessment_metrics(result: Dict[str, Any]) -> None:
     sources = result.get("sources", []) or []
+    stats = ((result.get("rule_engine") or {}).get("stats") or {})
     primary = sum(1 for s in sources if (s.get("source_type") or "").lower() == "primary")
     high_quality = sum(1 for s in sources if map_source_quality_label(s.get("weighted_score")) == "High")
-    contradictions = sum(1 for s in sources if normalize_claim_support(s.get("claim_support")) == "Contradicts")
+    contradictions = int(stats.get("contradictory_evidence", 0) or 0)
     elapsed = result.get("elapsed_seconds")
 
     st.markdown("### Assessment quality")
@@ -1088,13 +1112,14 @@ def align_reasoning_with_rules(reasoning: Dict[str, Any], rule_view: Dict[str, A
 
     # Collapse all downstream labels onto one canonical evidence-state.
     if stats.get("supportive_evidence", 0) == 0 and stats.get("evidentiary_sources", 0) == 0 and stats.get("rumor_or_context", 0) > 0:
+        contradiction_like = int(stats.get("contradictory_evidence", 0) or 0)
         reasoning["pendulum_band"] = "Context-heavy / unsubstantiated"
-        reasoning["pendulum_explanation"] = f"0 evidentiary source(s), {stats.get('contradictory_evidence', 0)} contradiction signal(s), {stats.get('rumor_or_context', 0)} rumor/context signal(s)"
+        reasoning["pendulum_explanation"] = f"0 evidentiary source(s), {contradiction_like} contradiction signal(s), {stats.get('rumor_or_context', 0)} rumor/context signal(s)"
         reasoning["consensus_strength"] = "Context-heavy / unsubstantiated"
         reasoning["consensus_summary"] = "The reviewed packet contains allegation, context, adjacency, denial, or rebuttal material, but no direct substantiating evidence for the claim as stated."
         if not rule_view["soft_claim"]:
             reasoning["verified_verdict"] = "Not supported by credible evidence"
-            reasoning["verified_confidence"] = "Medium" if stats.get("contradictory_evidence", 0) >= 1 else "Low"
+            reasoning["verified_confidence"] = "Medium" if contradiction_like >= 1 else "Low"
 
     concrete_override = (
         not rule_view["soft_claim"]
@@ -1261,9 +1286,13 @@ def split_evidence_vs_rumor(sources: List[Dict[str, Any]]) -> Dict[str, List[str
 
 
 def render_pendulum(band: str) -> None:
-    labels = ["Unsubstantiated rumor", "Weakly supported", "Mixed / uncertain", "Mostly supported", "Strongly evidenced"]
+    labels = ["Unsubstantiated rumor", "Weakly supported", "Mixed / uncertain", "Context-heavy / unsubstantiated", "Strongly evidenced"]
     pos_map = {label: idx for idx, label in enumerate(labels)}
-    pos = pos_map.get(band, 2)
+    # Map legacy mostly-supported displays into the nearest visible bucket only when needed.
+    if band == "Mostly supported":
+        pos = 3
+    else:
+        pos = pos_map.get(band, 2)
     cols = st.columns(5)
     for i, label in enumerate(labels):
         cols[i].markdown(f"**⬤ {label}**" if i == pos else f"◯ {label}")
@@ -1303,8 +1332,12 @@ def render_pipeline_result(result: Dict[str, Any]) -> None:
             st.caption("Risk flags: " + ", ".join(rule_engine.get("risk_flags")[:8]))
     render_evidence_snapshot(result.get("sources", []) or [])
 
+    stats = (rule_engine.get("stats") or {})
     band = result.get("pendulum_band", "")
     explanation = result.get("pendulum_explanation", "")
+    if stats.get("supportive_evidence", 0) == 0 and stats.get("evidentiary_sources", 0) == 0 and stats.get("rumor_or_context", 0) > 0:
+        band = "Context-heavy / unsubstantiated"
+        explanation = f"0 evidentiary source(s), {int(stats.get('contradictory_evidence', 0) or 0)} contradiction signal(s), {int(stats.get('rumor_or_context', 0) or 0)} rumor/context signal(s)"
     if band:
         st.markdown("### Evidence position")
         render_pendulum(band)
